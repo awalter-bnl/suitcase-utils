@@ -1,7 +1,9 @@
-import collections
-import io
-import os
 from pathlib import Path
+import collections
+import os
+import io
+import event_model
+from bluesky.plans import count
 from ._version import get_versions
 __version__ = get_versions()['version']
 del get_versions
@@ -19,38 +21,24 @@ class SuitcaseUtilsTypeError(SuitcaseUtilsError):
     ...
 
 
-class ModeError(SuitcaseUtilsError):
+class SuitcaseUtilsModeError(SuitcaseUtilsError):
     ...
 
 
-class UnknownEventType(SuitcaseUtilsError):
+class SuitcaseUtilsUnknownEventType(SuitcaseUtilsError):
     ...
 
 
-class MultiFileManager:
+class MultiFileWrapper:
     """
     A class that manages multiple files.
 
-    Parameters
-    ----------
-    directory : str or Path
-        The directory (as a string or as a Path) to create teh files inside.
-    allowed_modes : Iterable
-        Modes accepted by ``MultiFileManager.open``. By default this is
-        retricted to "exclusive creation" modes ('x', 'xt', 'xb') which raise
-        an error if the file already exists. This choice of defaults is meant
-        to protect the user for unintentionally overwriting old files. In
-        situations where overwrite ('w', 'wb') or append ('a', 'r+b') are
-        needed, they can be added here.
-
     This design is inspired by Python's zipfile and tarfile libraries.
     """
-    def __init__(self, directory, allowed_modes=('x', 'xt', 'xb')):
+    def __init__(self, directory):
         self._directory = Path(directory)
         self._reserved_names = set()
         self._artifacts = collections.defaultdict(list)
-        self._files = []
-        self._allowed_modes = set(allowed_modes)
 
     @property
     def artifacts(self):
@@ -66,15 +54,14 @@ class MultiFileManager:
         Parameters
         ----------
         label : string
-            A label for the sort of content being stored, such as
-            'stream_data' or 'metadata'.
+            partial file name (i.e. stream name)
         postfix : string
-            Postfix for the file name. Must be unique for this Manager.
+            relative file path and filename
 
         Returns
         -------
         name : Path
-        """
+         """
         if Path(postfix).is_absolute():
             raise SuitcaseUtilsValueError(
                 f"The postfix {postfix!r} must be structured like a relative "
@@ -94,73 +81,56 @@ class MultiFileManager:
         Like the built-in open function, this may be used as a context manager.
 
         Parameters
-        ----------
+        -------
         label : string
-            A label for the sort of content being stored, such as
-            'stream_data' or 'metadata'.
+            partial file name (i.e. stream name)
         postfix : string
-            Postfix for the file name. Must be unique for this Manager.
-        mode : string
-            One of the ``allowed_modes`` set in __init__``. Default set of
-            options is ``{'x', 'xt', xb'}`` --- 'x' or 'xt' for text, 'xb' for
-            binary.
+            postfix for the filenames.
+        mode : {'x', 'xt', xb'}
+            'x' or 'xt' for text, 'xb' for binary
         encoding : string or None
-            Passed through open. See Python open documentation for allowed
+            Passed through open.  See Python open documentation for allowed
             values. Only applicable to text mode.
         errors : string or None
             Passed through to open. See Python open documentation for allowed
             values.
-
-        Returns
-        -------
-        file : handle
+       Returns
+       -------
+       file : handle
         """
-        if mode not in self._allowed_modes:
-            raise ModeError(
-                f'The mode passed to MultiFileManager.open is {mode} but needs '
-                f'to be one of {self._allowed_modes}')
         filepath = self.reserve_name(label, postfix)
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        f = open(filepath, mode=mode, encoding=encoding, errors=errors)
-        self._files.append(f)
-        return f
+        # create the directories if they don't yet exist
+        if not os.path.exists(os.path.dirname(filepath)):
+            try:
+                os.makedirs(os.path.dirname(filepath))
+            except OSError as exc:
+                if exc.errno != errno.EEXIST:
+                    raise
 
-    def close(self):
-        '''close all files opened by the manager
-        '''
-        for f in self._files:
-            f.close()
+        if mode not in ['x', 'xt', 'xb']:
+            raise SuitcaseUtilsModeError(
+                f'the mode passed to MultiFileWrapper.open is {mode} but needs'
+                ' to be one of "x", "xt" or "xb"')
+        return open(filepath, mode=mode, encoding=encoding, errors=errors)
 
 
 class PersistentStringIO(io.StringIO):
-    ''' A StringIO that does not clear the buffer when closed.
+    ''' A version of StringIO that avoids closing the file n a context manager.
 
-        .. note::
-
-            This StringIO subclass behaves like StringIO except that its
-            close() method, which would normally clear the buffer, has no
-            effect. The clear() method, however, may still be used.
     '''
-    def close(self):
-        # Avoid clearing the buffer before caller of ``export`` can access it.
-        pass
+    def __exit__(*except_detail):
+        pass  # this avoids closing the file handle too early.
 
 
 class PersistentBytesIO(io.BytesIO):
-    ''' A BytesIO that does not clear the buffer when closed.
+    ''' A version of BytesIO that avoids closing the file n a context manager.
 
-        .. note::
-
-            This BytesIO subclass behaves like BytesIO except that its
-            close() method, which would normally clear the buffer, has no
-            effect. The clear() method, however, may still be used.
     '''
-    def close(self):
-        # Avoid clearing the buffer before caller of ``export`` can access it.
-        pass
+    def __exit__(*except_detail):
+        pass  # this avoids closing the file handle too early.
 
 
-class MemoryBuffersManager:
+class MemoryBuffersWrapper:
     """
     A class that manages multiple StringIO and/or BytesIO instances.
 
@@ -180,22 +150,24 @@ class MemoryBuffersManager:
 
     def reserve_name(self, label, postfix):
         """
-        This action is not valid on this manager. It will always raise.
+        Ask the wrapper for a filepath.
+
+        An external library that needs a filepath (not a handle)
+        may use this instead of the ``open`` method.
 
         Parameters
-        ----------
+        -------
         label : string
-            A label for the sort of content being stored, such as
-            'stream_data' or 'metadata'.
+            partial file name (i.e. stream name)
         postfix : string
-            Relative file path. Must be unique for this Manager.
+            relative file path and filename
 
-        Raises
-        ------
-        SuitcaseUtilsTypeError
-        """
+        Returns
+        ----------
+        filepath : Path
+         """
         raise SuitcaseUtilsTypeError(
-            "MemoryBuffersManager is incompatible with exporters that require "
+            "MemoryBuffersWrapper is incompatible with exporters that require "
             "explicit filenames.")
 
     def open(self, label, postfix, mode, encoding=None, errors=None):
@@ -205,13 +177,11 @@ class MemoryBuffersManager:
         Like the built-in open function, this may be used as a context manager.
 
         Parameters
-        ----------
+        -------
         label : string
-            A label for the sort of content being stored, such as
-            'stream_data' or 'metadata'.
+            partial file name (i.e. stream name)
         postfix : string
-            Relative file path (simply used as an identifer in this case, as
-            there is no actual file). Must be unique for this Manager.
+            relative file path and filename
         mode : {'x', 'xt', xb'}
             'x' or 'xt' for text, 'xb' for binary
         encoding : string or None
@@ -219,36 +189,29 @@ class MemoryBuffersManager:
         errors : string or None
             Not used. Accepted for compatibility with built-in open().
 
-        Returns
-        -------
-        file : handle
+       Returns
+       -------
+       file : handle
         """
         # Of course, in-memory buffers have no filepath, but we still expect
         # postfix to be a thing that looks like a relative filepath, and we use
         # it as a unique identifier for a given buffer.
         if Path(postfix).is_absolute():
             raise SuitcaseUtilsValueError(
-                f"The postfix {postfix} must be structured like a relative "
-                f"file path.")
+                f"{postfix} must be structured like a relative file path.")
         name = Path(postfix).expanduser().resolve()
         if name in self._reserved_names:
             raise SuitcaseUtilsValueError(
                 f"The postfix {postfix!r} has already been used.")
         self._reserved_names.add(name)
+        self._artifacts[label].append(name)
         if mode in ('x', 'xt'):
             buffer = PersistentStringIO()
         elif mode == 'xb':
             buffer = PersistentBytesIO()
         else:
-            raise ModeError(
-                f"The mode passed to MemoryBuffersManager.open is {mode} but "
-                f"needs to be one of 'x', 'xt' or 'xb'.")
-        self._artifacts[label].append(buffer)
+            raise SuitcaseUtilsModeError(
+                f'the mode passed to MemoryBuffersWrapper.open is {mode} but '
+                'needs to be one of "x", "xt" or "xb"')
         self.buffers[postfix] = buffer
         return buffer
-
-    def close(self):
-        '''Close all buffers opened by the manager.
-        '''
-        for f in self.buffers.values():
-            f.close()
